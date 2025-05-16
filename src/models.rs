@@ -1,18 +1,13 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::schema::domains;
+use crate::schema::cetus_custom_indexer;
 use diesel::prelude::*;
 
 #[derive(Queryable, Selectable, Insertable, AsChangeset, Debug)]
-#[diesel(table_name = domains)]
+#[diesel(table_name = cetus_custom_indexer)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
-pub struct Domain {
-    pub name: String,
-    pub parent: String,
-    pub expiration_timestamp_ms: i64,
-    pub nft_id: String,
-    pub field_id: String,
-    pub target_address: Option<String>,
-    pub last_checkpoint_updated: i64,
+pub struct CetusCustomIndexer {
+    pub pool_id: String,
+    pub total_volume_24h: String,
 }

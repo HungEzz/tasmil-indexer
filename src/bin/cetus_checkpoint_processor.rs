@@ -4,6 +4,7 @@
 use dotenvy::dotenv;
 use mysten_service::metrics::start_basic_prometheus_server;
 use prometheus::Registry;
+use diesel::{dsl::sql, ExpressionMethods};
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,28 +16,81 @@ use tokio::sync::{oneshot, Mutex};
 use tracing::{info, Level, error};
 use async_trait::async_trait;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::PgPool;
+use sqlx::{Pool, Postgres};
 use anyhow::Result;
-
+use diesel_async::AsyncConnection;
 use suins_indexer::cetus_indexer::{
      CetusIndexer,
      start_volume_update_job,
      create_volume_data_table,
+     SwapEvent,
 };
-
+use suins_indexer::models::CetusCustomIndexer;
+use suins_indexer::schema::cetus_custom_indexer;
+use suins_indexer::{PgConnectionPool, PgConnectionPoolExt};
+use diesel_async::RunQueryDsl;
+use diesel_async::scoped_futures::ScopedFutureExt;
 struct CetusIndexerWorker {
     indexer: Arc<Mutex<CetusIndexer>>,
-    pool: Option<PgPool>,
+    pg_pool: PgConnectionPool,
+    sqlx_pool: Option<Pool<Postgres>>,
 }
 
 impl CetusIndexerWorker {
-    fn new(indexer: Arc<Mutex<CetusIndexer>>, pool: Option<PgPool>) -> Self {
+    fn new(indexer: Arc<Mutex<CetusIndexer>>, pg_pool: PgConnectionPool, sqlx_pool: Option<Pool<Postgres>>) -> Self {
         Self {
             indexer,
-            pool,
+            pg_pool,
+            sqlx_pool,
         }
     }
+
+    async fn commit_to_db(
+        &self,
+        swap_events: &[SwapEvent],
+    ) -> Result<()> {
+        let mut connection = self.pg_pool.get().await.unwrap();
+
+        // Convert SwapEvent to CetusCustomIndexer
+        let cetus_custom_events: Vec<CetusCustomIndexer> = swap_events
+            .iter()
+            .map(|event| {
+                let usdc_amount = if event.atob { event.amount_in } else { event.amount_out };
+                CetusCustomIndexer {
+                    pool_id: event.pool_id.clone(),
+                    total_volume_24h: usdc_amount.to_string(),
+                }
+            })
+            .collect();
+
+        connection
+            .transaction::<_, anyhow::Error, _>(|conn| {
+                async move {
+                    if !cetus_custom_events.is_empty() {
+                        diesel_async::RunQueryDsl::execute(
+                            diesel::insert_into(cetus_custom_indexer::table)
+                                .values(&cetus_custom_events)
+                                .on_conflict(cetus_custom_indexer::pool_id)
+                                .do_update()
+                                .set((
+                                    cetus_custom_indexer::total_volume_24h.eq(sql("excluded.total_volume_24h")),
+                                )),
+                            conn
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            panic!("Failed to process swap events: {:?}", swap_events)
+                        });
+                    }
+
+                    Ok(())
+                }
+                .scope_boxed()
+            })
+            .await
+        }
 }
+
 
 #[async_trait]
 impl Worker for CetusIndexerWorker {
@@ -45,8 +99,8 @@ impl Worker for CetusIndexerWorker {
         // Get a mutable reference to the indexer
         let mut indexer = self.indexer.lock().await;
         
-        // Process the checkpoint - returns swap events now instead of transactions
-        let swap_events = indexer.process_checkpoint(checkpoint, self.pool.as_ref()).await;
+        // Process the checkpoint - pass sqlx_pool as Option<&Pool<Postgres>>
+        let swap_events = indexer.process_checkpoint(checkpoint, self.sqlx_pool.as_ref()).await;
         
         if !swap_events.is_empty() {
             info!("------------------------------------");
@@ -67,7 +121,7 @@ impl Worker for CetusIndexerWorker {
             // Log current 24h volume
             info!("💰 Current 24h USDC Volume: ${:.2}", indexer.get_usdc_volume_24h());
         }
-        
+        self.commit_to_db(&swap_events).await?;
         Ok(())
     }
 }
@@ -112,8 +166,9 @@ async fn main() -> Result<()> {
     // Create a new CetusIndexer instance
     let indexer = Arc::new(Mutex::new(CetusIndexer::new()));
     
-    // Setup database if enabled
-    let pool = if use_database {
+    // Setup database connection pools
+    let diesel_pool = PgConnectionPool::new(&database_url);
+    let sqlx_pool = if use_database {
         let pool = PgPoolOptions::new()
             .max_connections(5)
             .connect(&database_url)
@@ -160,7 +215,7 @@ async fn main() -> Result<()> {
     };
 
     let worker_pool = WorkerPool::new(
-        CetusIndexerWorker::new(indexer.clone(), pool),
+        CetusIndexerWorker::new(indexer.clone(), diesel_pool, sqlx_pool),
         "cetus_indexing".to_string(),
         25, // lower concurrency since we're just logging
     );

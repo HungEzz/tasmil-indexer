@@ -985,6 +985,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bigdecimal"
+version = "0.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a22f228ab7a1b23027ccc6c350b72868017af7ea8356fbdf19f8d991c690013"
+dependencies = [
+ "autocfg",
+ "libm",
+ "num-bigint 0.4.6",
+ "num-integer",
+ "num-traits",
+ "serde",
+]
+
+[[package]]
 name = "bincode"
 version = "1.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8143,6 +8157,7 @@ dependencies = [
  "backoff",
  "base64-url",
  "bcs",
+ "bigdecimal",
  "bytes",
  "chrono",
  "diesel",
@@ -8156,6 +8171,7 @@ dependencies = [
  "object_store 0.8.0",
  "prometheus",
  "rand 0.8.5",
+ "regex",
  "rustls",
  "serde",
  "serde_json",

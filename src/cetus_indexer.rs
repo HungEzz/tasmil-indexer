@@ -16,7 +16,6 @@ use std::sync::Arc;
 const SUI_USDC_POOL_ID: &str = "0xb8d7d9e66a60c239e7a60110efcf8de6c705580ed924d0dde141f4a0e2c90105";
 /// Cetus pool contract address
 const CETUS_ADDRESS: &str = "1eabed72c53feb3805120a081dc15963c204dc8d091542592abaf7a35689b2fb";
-
 /// Returns a tuple containing (pool_id, amount_in, amount_out, atob) if successful
 fn decode_swap_event_contents(contents: &[serde_json::Value]) -> Option<(String, u64, u64, bool)> {
     if contents.len() < 146 {
@@ -149,10 +148,33 @@ impl CetusIndexer {
             }
         }
 
-        // Update checkpoint tracking and calculate volume
-        self.last_processed_checkpoint = checkpoint_seq_number;
-        self.calculate_volume_24h();
+        // Nếu có swap events mới, tính toán volume từ các events đó
+        if !new_swap_events.is_empty() {
+            let mut current_usdc_volume = self.volume_24h.usdc_volume;
+            
+            // Tính volume từ swap events mới
+            for event in &new_swap_events {
+                if event.atob {
+                    // USDC -> SUI: amount_in là USDC
+                    current_usdc_volume += event.amount_in as f64;
+                } else {
+                    // SUI -> USDC: amount_out là USDC  
+                    current_usdc_volume += event.amount_out as f64;
+                }
+            }
+            
+            // Cập nhật volume data
+            self.volume_24h = VolumeData {
+                total_volume: current_usdc_volume,
+                usdc_volume: current_usdc_volume,
+                last_update: SystemTime::now(),
+            };
+        }
 
+        // Update checkpoint tracking
+        self.last_processed_checkpoint = checkpoint_seq_number;
+
+        // Cập nhật database nếu có
         if let Some(pool) = pool {
             if checkpoint_seq_number % 10 == 0 || !new_swap_events.is_empty() {
                 if let Err(err) = self.update_volume_24h_in_database(pool).await {
@@ -280,23 +302,26 @@ impl CetusIndexer {
         let now = SystemTime::now();
         let now_sql = chrono::DateTime::<chrono::Utc>::from(now).naive_utc();
         
-        // Build and execute query
+        // Convert volume to string to avoid type mismatches with NUMERIC
+        let usdc_volume_str = format!("{:.8}", self.volume_24h.usdc_volume);
+        let total_volume_str = format!("{:.8}", self.volume_24h.total_volume);
+        
+        // Build and execute query with string parameters
         let query = format!(
             "INSERT INTO volume_data (period, total_volume, usdc_volume, last_update, last_processed_checkpoint) 
-             VALUES ('24h', {}, {}, '{}', {})
+             VALUES ('24h', '{}', '{}', $1, {})
              ON CONFLICT (period) 
-             DO UPDATE SET total_volume = {}, usdc_volume = {}, last_update = '{}', last_processed_checkpoint = {}",
-            self.volume_24h.usdc_volume,
-            self.volume_24h.usdc_volume,
-            now_sql,
+             DO UPDATE SET total_volume = '{}', usdc_volume = '{}', last_update = $1, last_processed_checkpoint = {}",
+            total_volume_str,
+            usdc_volume_str,
             self.last_processed_checkpoint,
-            self.volume_24h.usdc_volume,
-            self.volume_24h.usdc_volume,
-            now_sql,
+            total_volume_str,
+            usdc_volume_str,
             self.last_processed_checkpoint
         );
         
         sqlx::query(&query)
+            .bind(now_sql)
             .execute(pool)
             .await?;
         
@@ -312,8 +337,14 @@ impl CetusIndexer {
             .await?;
         
         if let Some(row) = row {
-            let total_volume: f64 = row.get("total_volume");
-            let usdc_volume: f64 = row.try_get("usdc_volume").unwrap_or(0.0);
+            // Get values as Decimal strings first, then parse them to f64
+            let total_volume_str: String = row.try_get("total_volume")?;
+            let usdc_volume_str: String = row.try_get("usdc_volume").unwrap_or_else(|_| "0".to_string());
+            
+            // Convert from string to f64
+            let total_volume = total_volume_str.parse::<f64>().unwrap_or(0.0);
+            let usdc_volume = usdc_volume_str.parse::<f64>().unwrap_or(0.0);
+            
             let last_update: chrono::NaiveDateTime = row.get("last_update");
             
             Ok(VolumeData {
@@ -384,8 +415,8 @@ pub async fn create_volume_data_table(pool: &PgPool) -> Result<(), Error> {
         "CREATE TABLE IF NOT EXISTS volume_data (
             id SERIAL PRIMARY KEY,
             period VARCHAR(50) NOT NULL UNIQUE,
-            total_volume DECIMAL(30, 8) NOT NULL,
-            usdc_volume DECIMAL(30, 8) NOT NULL DEFAULT 0,
+            total_volume NUMERIC(30, 8) NOT NULL,
+            usdc_volume NUMERIC(30, 8) NOT NULL DEFAULT 0,
             last_update TIMESTAMP NOT NULL,
             last_processed_checkpoint BIGINT NOT NULL DEFAULT 0
         )"
@@ -408,3 +439,4 @@ mod tests {
         assert_eq!(indexer.swap_events.len(), 0);
     }
 } 
+
