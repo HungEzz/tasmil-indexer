@@ -45,51 +45,51 @@ impl CetusIndexerWorker {
         }
     }
 
-    async fn commit_to_db(
-        &self,
-        swap_events: &[SwapEvent],
-    ) -> Result<()> {
-        let mut connection = self.pg_pool.get().await.unwrap();
+//     async fn commit_to_db(
+//         &self,
+//         swap_events: &[SwapEvent],
+//     ) -> Result<()> {
+//         let mut connection = self.pg_pool.get().await.unwrap();
 
-        // Convert SwapEvent to CetusCustomIndexer
-        let cetus_custom_events: Vec<CetusCustomIndexer> = swap_events
-            .iter()
-            .map(|event| {
-                let usdc_amount = if event.atob { event.amount_in } else { event.amount_out };
-                CetusCustomIndexer {
-                    pool_id: event.pool_id.clone(),
-                    total_volume_24h: usdc_amount.to_string(),
-                }
-            })
-            .collect();
+//         // Convert SwapEvent to CetusCustomIndexer
+//         let cetus_custom_events: Vec<CetusCustomIndexer> = swap_events
+//             .iter()
+//             .map(|event| {
+//                 let usdc_amount = if event.atob { event.amount_in } else { event.amount_out };
+//                 CetusCustomIndexer {
+//                     pool_id: event.pool_id.clone(),
+//                     total_volume_24h: usdc_amount.to_string(),
+//                 }
+//             })
+//             .collect();
 
-        connection
-            .transaction::<_, anyhow::Error, _>(|conn| {
-                async move {
-                    if !cetus_custom_events.is_empty() {
-                        diesel_async::RunQueryDsl::execute(
-                            diesel::insert_into(cetus_custom_indexer::table)
-                                .values(&cetus_custom_events)
-                                .on_conflict(cetus_custom_indexer::pool_id)
-                                .do_update()
-                                .set((
-                                    cetus_custom_indexer::total_volume_24h.eq(sql("excluded.total_volume_24h")),
-                                )),
-                            conn
-                        )
-                        .await
-                        .unwrap_or_else(|_| {
-                            panic!("Failed to process swap events: {:?}", swap_events)
-                        });
-                    }
+//         connection
+//             .transaction::<_, anyhow::Error, _>(|conn| {
+//                 async move {
+//                     if !cetus_custom_events.is_empty() {
+//                         diesel_async::RunQueryDsl::execute(
+//                             diesel::insert_into(cetus_custom_indexer::table)
+//                                 .values(&cetus_custom_events)
+//                                 .on_conflict(cetus_custom_indexer::pool_id)
+//                                 .do_update()
+//                                 .set((
+//                                     cetus_custom_indexer::total_volume_24h.eq(sql("excluded.total_volume_24h")),
+//                                 )),
+//                             conn
+//                         )
+//                         .await
+//                         .unwrap_or_else(|_| {
+//                             panic!("Failed to process swap events: {:?}", swap_events)
+//                         });
+//                     }
 
-                    Ok(())
-                }
-                .scope_boxed()
-            })
-            .await
-        }
-}
+//                     Ok(())
+//                 }
+//                 .scope_boxed()
+//             })
+//             .await
+//         }
+ }
 
 
 #[async_trait]
@@ -114,14 +114,14 @@ impl Worker for CetusIndexerWorker {
                 info!("Amount In: {}", event.amount_in);
                 info!("Amount Out: {}", event.amount_out);
                 info!("Direction: {}", if event.atob { "USDC -> SUI" } else { "SUI -> USDC" });
-                info!("USDC Amount: {}", if event.atob { event.amount_in } else { event.amount_out });
+                info!("SUI Amount: {}", if event.atob { event.amount_out } else { event.amount_in });
                 info!("------------------------------------");
             }
             
             // Log current 24h volume
-            info!("💰 Current 24h USDC Volume: ${:.2}", indexer.get_usdc_volume_24h());
+            info!("💰 Current 24h Volume: ${:.2}", indexer.volume_24h.sui_usd_volume / 1_000_000.0);
         }
-        self.commit_to_db(&swap_events).await?;
+        // self.commit_to_db(&swap_events).await?;
         Ok(())
     }
 }
@@ -143,7 +143,7 @@ async fn main() -> Result<()> {
     
     // Database connection string
     let database_url = env::var("DATABASE_URL")
-        .unwrap_or("postgres://postgres:postgres@localhost/suins_indexer".to_string());
+        .unwrap_or("postgres://manager1:manager1@localhost:5432/tasmil_custom_indexer".to_string());
     
     // Flag to enable/disable database
     let use_database = env::var("USE_DATABASE")
@@ -193,9 +193,9 @@ async fn main() -> Result<()> {
         
         match CetusIndexer::get_volume_24h_from_database(&pool).await {
             Ok(volume_data) => {
-                let usdc_volume = volume_data.usdc_volume;
+                let sui_usd_volume = volume_data.sui_usd_volume;
                 indexer_locked.volume_24h = volume_data;
-                info!("✅ Loaded 24h volume from database: ${:.2}", usdc_volume);
+                info!("✅ Loaded 24h volume from database: ${:.2}", sui_usd_volume / 1_000_000.0);
             }
             Err(err) => {
                 error!("❌ Failed to load 24h volume from database: {}", err);

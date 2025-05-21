@@ -11,6 +11,7 @@ use sqlx::Row;
 use anyhow::Error;
 use tokio::sync::Mutex;
 use std::sync::Arc;
+use reqwest;
 
 /// The SUI-USDC pool ID to track
 const SUI_USDC_POOL_ID: &str = "0xb8d7d9e66a60c239e7a60110efcf8de6c705580ed924d0dde141f4a0e2c90105";
@@ -95,8 +96,7 @@ pub struct SwapEvent {
 /// Holds aggregated volume data over a time period
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeData {
-    pub total_volume: f64,
-    pub usdc_volume: f64,
+    pub sui_usd_volume: f64,
     pub last_update: SystemTime,
 }
 
@@ -117,8 +117,7 @@ impl CetusIndexer {
         Self {
             swap_events: Vec::new(),
             volume_24h: VolumeData {
-                total_volume: 0.0,
-                usdc_volume: 0.0,
+                sui_usd_volume: 0.0,
                 last_update: SystemTime::now(),
             },
             last_processed_checkpoint: 0,
@@ -128,13 +127,17 @@ impl CetusIndexer {
     /// Process a checkpoint and extract Cetus-related swap events
     /// 
     /// Returns a vector of newly found swap events
-    pub async fn process_checkpoint(&mut self, data: &CheckpointData, pool: Option<&PgPool>) -> Vec<SwapEvent> {
+    pub async fn process_checkpoint(
+        &mut self, 
+        data: &CheckpointData, 
+        pool: Option<&PgPool>
+    ) -> Vec<SwapEvent> {
         let checkpoint_seq_number = data.checkpoint_summary.sequence_number;
         let mut new_swap_events = Vec::new();
         let checkpoint_timestamp = data.checkpoint_summary.timestamp();
 
         // Log basic checkpoint information
-        debug!("Processing checkpoint {} with {} transactions", 
+        info!("aaaaProcessing checkpoint {} with {} transactions", 
              checkpoint_seq_number, data.transactions.len());
 
         for transaction in &data.transactions {
@@ -148,44 +151,27 @@ impl CetusIndexer {
             }
         }
 
-        // Nếu có swap events mới, tính toán volume từ các events đó
+        // If there are new swap events, calculate volume with Pyth price
         if !new_swap_events.is_empty() {
-            let mut current_usdc_volume = self.volume_24h.usdc_volume;
+            let volume = self.calculate_volume_24h().await;
             
-            // Tính volume từ swap events mới
-            for event in &new_swap_events {
-                if event.atob {
-                    // USDC -> SUI: amount_in là USDC
-                    current_usdc_volume += event.amount_in as f64;
-                } else {
-                    // SUI -> USDC: amount_out là USDC  
-                    current_usdc_volume += event.amount_out as f64;
-                }
-            }
+            // Convert from microdollar to dollar for display
+            let volume_in_dollars = volume / 1_000_000.0;
             
-            // Cập nhật volume data
-            self.volume_24h = VolumeData {
-                total_volume: current_usdc_volume,
-                usdc_volume: current_usdc_volume,
-                last_update: SystemTime::now(),
-            };
+            info!("📊 Checkpoint {}: Found {} swap events | 24h Volume: ${:.2}", 
+                 checkpoint_seq_number, new_swap_events.len(), volume_in_dollars);
         }
 
         // Update checkpoint tracking
         self.last_processed_checkpoint = checkpoint_seq_number;
 
-        // Cập nhật database nếu có
+        // Update database if available
         if let Some(pool) = pool {
             if checkpoint_seq_number % 10 == 0 || !new_swap_events.is_empty() {
                 if let Err(err) = self.update_volume_24h_in_database(pool).await {
                     error!("Failed to update volume in database: {}", err);
                 }
             }
-        }
-
-        if !new_swap_events.is_empty() {
-            info!("📊 Checkpoint {}: Found {} swap events | 24h Volume: ${:.2}", 
-                 checkpoint_seq_number, new_swap_events.len(), self.volume_24h.usdc_volume);
         }
 
         new_swap_events
@@ -250,40 +236,15 @@ impl CetusIndexer {
         matching_events
     }
     
-    /// Calculate 24-hour USDC volume from stored swap events
-    pub fn calculate_volume_24h(&mut self) -> f64 {
+    /// Calculate 24-hour volume in USD from stored swap events
+    pub async fn calculate_volume_24h(&mut self) -> f64 {
         let now = SystemTime::now();
         let twenty_four_hours_ago = now.checked_sub(Duration::from_secs(24 * 60 * 60))
             .unwrap_or(UNIX_EPOCH);
-        // Filter events from the last 24 hours
-        let recent_events: Vec<&SwapEvent> = self.swap_events.iter()
-            .filter(|event| event.timestamp >= twenty_four_hours_ago)
-            .collect();
-            
-        // Calculate USDC volume
-        let mut usdc_volume: f64 = 0.0;
         
-        for event in recent_events.iter() {
-            // Calculate USDC volume based on atob flag
-            if event.atob {
-                // USDC -> SUI: amount_in is USDC
-                usdc_volume += event.amount_in as f64;
-            } else {
-                // SUI -> USDC: amount_out is USDC
-                usdc_volume += event.amount_out as f64;
-            }
-        }
-        
-        // Update volume data
-        self.volume_24h = VolumeData {
-            total_volume: usdc_volume,
-            usdc_volume,
-            last_update: SystemTime::now(),
-        };
-        
-        // Prune old events (older than 25 hours)
+        // Pruning old events (older than 25 hours)
         let retention_cutoff = now
-            .checked_sub(Duration::from_secs(25 * 60 * 60)) // Keep an extra hour for safety
+            .checked_sub(Duration::from_secs(24 * 60 * 60 + 1)) // Keep an extra hour for safety
             .unwrap_or(UNIX_EPOCH);
         
         let old_events_count = self.swap_events.len();
@@ -294,7 +255,61 @@ impl CetusIndexer {
                 old_events_count - self.swap_events.len(), self.swap_events.len());
         }
         
-        usdc_volume
+        // Filter events from the last 24 hours
+        let recent_events: Vec<&SwapEvent> = self.swap_events.iter()
+            .filter(|event| event.timestamp >= twenty_four_hours_ago)
+            .collect();
+        
+        // Get SUI price in USD
+        let sui_price_usd = match get_sui_price_from_pyth().await {
+            Ok(price) => price,
+            Err(e) => {
+                error!("Failed to get SUI price from Pyth: {}", e);
+                // Use a default price or fetch from an alternative source
+                // For now, we'll use a simple estimation based on USDC (1:1 with USD)
+                1.0
+            }
+        };
+        
+        // Calculate USD volume - sửa lại phương pháp tính toán
+        let mut sui_usd_volume: f64 = 0.0;
+        
+        for event in recent_events.iter() {
+            // Bỏ qua các sự kiện có giá trị không hợp lệ
+            if event.amount_in == 0 || event.amount_out == 0 {
+                continue;
+            }
+            
+            // Kiểm tra timestamp hợp lệ (không trong tương lai)
+            if event.timestamp > now {
+                error!("Skipping event with future timestamp: {:?}", event);
+                continue;
+            }
+            
+            // Tính toán khối lượng cho từng sự kiện riêng lẻ
+            let sui_amount = if event.atob {
+                // USDC → SUI: amount_out is SUI
+                event.amount_out as f64 / 1_000_000_000.0 // Convert from 1e9 (SUI decimals)
+            } else {
+                // SUI → USDC: amount_in is SUI
+                event.amount_in as f64 / 1_000_000_000.0 // Convert from 1e9 (SUI decimals)
+            };
+            
+            // Tính giá trị USD cho lượng SUI của sự kiện này
+            let event_value_in_usd = sui_amount * sui_price_usd * 1_000_000.0; // Convert to microdollars
+            sui_usd_volume += event_value_in_usd;
+        }
+        
+        // Update volume data
+        self.volume_24h = VolumeData {
+            sui_usd_volume,
+            last_update: SystemTime::now(),
+        };
+        
+        info!("Volume calculation: USD=${:.2}, SUI price=${:.4}", 
+             sui_usd_volume / 1_000_000.0, sui_price_usd);
+        
+        sui_usd_volume
     }
     
     /// Update 24-hour volume in the database
@@ -303,20 +318,17 @@ impl CetusIndexer {
         let now_sql = chrono::DateTime::<chrono::Utc>::from(now).naive_utc();
         
         // Convert volume to string to avoid type mismatches with NUMERIC
-        let usdc_volume_str = format!("{:.8}", self.volume_24h.usdc_volume);
-        let total_volume_str = format!("{:.8}", self.volume_24h.total_volume);
+        let sui_usd_volume_str = format!("{:.8}", self.volume_24h.sui_usd_volume);
         
         // Build and execute query with string parameters
         let query = format!(
-            "INSERT INTO volume_data (period, total_volume, usdc_volume, last_update, last_processed_checkpoint) 
-             VALUES ('24h', '{}', '{}', $1, {})
+            "INSERT INTO volume_data (period, sui_usd_volume, last_update, last_processed_checkpoint) 
+             VALUES ('24h', '{}', $1, {})
              ON CONFLICT (period) 
-             DO UPDATE SET total_volume = '{}', usdc_volume = '{}', last_update = $1, last_processed_checkpoint = {}",
-            total_volume_str,
-            usdc_volume_str,
+             DO UPDATE SET sui_usd_volume = '{}', last_update = $1, last_processed_checkpoint = {}",
+            sui_usd_volume_str,
             self.last_processed_checkpoint,
-            total_volume_str,
-            usdc_volume_str,
+            sui_usd_volume_str,
             self.last_processed_checkpoint
         );
         
@@ -325,31 +337,28 @@ impl CetusIndexer {
             .execute(pool)
             .await?;
         
-        debug!("Updated 24h volume in database: USDC=${:.2}", self.volume_24h.usdc_volume);
+        debug!("Updated 24h volume in database: USD=${:.2}", self.volume_24h.sui_usd_volume / 1_000_000.0);
         
         Ok(())
     }
     
     /// Retrieve 24-hour volume data from the database
     pub async fn get_volume_24h_from_database(pool: &PgPool) -> Result<VolumeData, Error> {
-        let row = sqlx::query("SELECT total_volume, usdc_volume, last_update FROM volume_data WHERE period = '24h'")
+        let row = sqlx::query("SELECT sui_usd_volume, last_update FROM volume_data WHERE period = '24h'")
             .fetch_optional(pool)
             .await?;
         
         if let Some(row) = row {
             // Get values as Decimal strings first, then parse them to f64
-            let total_volume_str: String = row.try_get("total_volume")?;
-            let usdc_volume_str: String = row.try_get("usdc_volume").unwrap_or_else(|_| "0".to_string());
+            let sui_usd_volume_str: String = row.try_get("sui_usd_volume")?;
             
             // Convert from string to f64
-            let total_volume = total_volume_str.parse::<f64>().unwrap_or(0.0);
-            let usdc_volume = usdc_volume_str.parse::<f64>().unwrap_or(0.0);
+            let sui_usd_volume = sui_usd_volume_str.parse::<f64>().unwrap_or(0.0);
             
             let last_update: chrono::NaiveDateTime = row.get("last_update");
             
             Ok(VolumeData {
-                total_volume,
-                usdc_volume,
+                sui_usd_volume,
                 last_update: chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
                     last_update, 
                     chrono::Utc
@@ -357,8 +366,7 @@ impl CetusIndexer {
             })
         } else {
             Ok(VolumeData {
-                total_volume: 0.0,
-                usdc_volume: 0.0,
+                sui_usd_volume: 0.0,
                 last_update: SystemTime::now(),
             })
         }
@@ -382,11 +390,6 @@ impl CetusIndexer {
     pub fn get_swap_events(&self) -> &Vec<SwapEvent> {
         &self.swap_events
     }
-    
-    /// Get the current USDC volume for the last 24 hours
-    pub fn get_usdc_volume_24h(&self) -> f64 {
-        self.volume_24h.usdc_volume
-    }
 }
 
 /// Background job to periodically update volume data
@@ -400,23 +403,30 @@ pub async fn start_volume_update_job(indexer: Arc<Mutex<CetusIndexer>>, pool: Pg
         let mut indexer_locked = indexer.lock().await;
         
         // Calculate new volume and update database
-        let volume = indexer_locked.calculate_volume_24h();
+        let volume = indexer_locked.calculate_volume_24h().await;
+        let volume_in_dollars = volume / 1_000_000.0;
+
         if let Err(err) = indexer_locked.update_volume_24h_in_database(&pool).await {
             error!("❌ Scheduled volume update failed: {}", err);
         } else {
-            info!("✅ Updated 24h Volume: ${:.2}", volume);
+            info!("✅ Updated 24h Volume: ${:.2}", volume_in_dollars);
         }
     }
 }
 
 /// Create the volume_data table in the database if it doesn't exist
 pub async fn create_volume_data_table(pool: &PgPool) -> Result<(), Error> {
+    // Drop the existing table if it exists
+    sqlx::query!("DROP TABLE IF EXISTS volume_data")
+        .execute(pool)
+        .await?;
+    
+    // Create a new table with only the required fields
     sqlx::query!(
-        "CREATE TABLE IF NOT EXISTS volume_data (
+        "CREATE TABLE volume_data (
             id SERIAL PRIMARY KEY,
             period VARCHAR(50) NOT NULL UNIQUE,
-            total_volume NUMERIC(30, 8) NOT NULL,
-            usdc_volume NUMERIC(30, 8) NOT NULL DEFAULT 0,
+            sui_usd_volume NUMERIC(30, 8) NOT NULL DEFAULT 0,
             last_update TIMESTAMP NOT NULL,
             last_processed_checkpoint BIGINT NOT NULL DEFAULT 0
         )"
@@ -424,7 +434,7 @@ pub async fn create_volume_data_table(pool: &PgPool) -> Result<(), Error> {
     .execute(pool)
     .await?;
     
-    info!("📦 Volume data table created or verified in database");
+    info!("📦 Volume data table recreated with only sui_usd_volume field");
     
     Ok(())
 }
@@ -439,4 +449,41 @@ mod tests {
         assert_eq!(indexer.swap_events.len(), 0);
     }
 } 
+
+/// Get SUI price in USD from Pyth Network
+async fn get_sui_price_from_pyth() -> Result<f64, Error> {
+    // Create a reqwest client to interact with the Pyth Network API
+    let client = reqwest::Client::new();
+
+    // SUI/USD price feed ID (without 0x prefix)
+    let price_id = "23d7315113f5b1d3ba7a83604c44b94d79f4fd69af77f804fc7f920a6dc65744";
+
+    // Fetch the price feed using the REST API
+    let url = format!("https://hermes.pyth.network/api/latest_price_feeds?ids[]={}", price_id);
+    let response = client.get(&url).send().await?;
+    let price_feed_data: serde_json::Value = response.json().await?;
+    
+    debug!("Got price feed data from Pyth Network");
+    
+    // Parse the price from the response
+    if let Some(price_data) = price_feed_data.as_array().and_then(|arr| arr.first()) {
+        if let Some(price_obj) = price_data.get("price") {
+            // Try to parse the price values
+            let price = price_obj["price"].as_str()
+                .ok_or_else(|| anyhow::anyhow!("Price value not found or not a string"))?
+                .parse::<i64>()?;
+                
+            let expo = price_obj["expo"].as_i64()
+                .ok_or_else(|| anyhow::anyhow!("Expo value not found"))?;
+            
+            // Calculate the actual price value with exponent
+            let sui_price_usd = (price as f64) * 10f64.powi(expo as i32);
+
+            info!("SUI/USD Price: ${:.4}", sui_price_usd);
+            return Ok(sui_price_usd);
+        }
+    }
+    
+    Err(anyhow::anyhow!("Failed to parse price feed data from Pyth Network"))
+}
 
