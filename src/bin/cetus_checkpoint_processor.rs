@@ -20,16 +20,19 @@ use sqlx::{Pool, Postgres};
 use anyhow::Result;
 use diesel_async::AsyncConnection;
 use suins_indexer::cetus_indexer::{
-     CetusIndexer,
-     start_volume_update_job,
-     create_volume_data_table,
-     SwapEvent,
+    CetusIndexer,
+    start_volume_update_job,
+    create_volume_data_table,
+    SwapEvent,
+    TvlData,
+    VolumeData,
 };
 use suins_indexer::models::CetusCustomIndexer;
 use suins_indexer::schema::cetus_custom_indexer;
 use suins_indexer::{PgConnectionPool, PgConnectionPoolExt};
 use diesel_async::RunQueryDsl;
 use diesel_async::scoped_futures::ScopedFutureExt;
+
 struct CetusIndexerWorker {
     indexer: Arc<Mutex<CetusIndexer>>,
     pg_pool: PgConnectionPool,
@@ -44,53 +47,7 @@ impl CetusIndexerWorker {
             sqlx_pool,
         }
     }
-
-//     async fn commit_to_db(
-//         &self,
-//         swap_events: &[SwapEvent],
-//     ) -> Result<()> {
-//         let mut connection = self.pg_pool.get().await.unwrap();
-
-//         // Convert SwapEvent to CetusCustomIndexer
-//         let cetus_custom_events: Vec<CetusCustomIndexer> = swap_events
-//             .iter()
-//             .map(|event| {
-//                 let usdc_amount = if event.atob { event.amount_in } else { event.amount_out };
-//                 CetusCustomIndexer {
-//                     pool_id: event.pool_id.clone(),
-//                     total_volume_24h: usdc_amount.to_string(),
-//                 }
-//             })
-//             .collect();
-
-//         connection
-//             .transaction::<_, anyhow::Error, _>(|conn| {
-//                 async move {
-//                     if !cetus_custom_events.is_empty() {
-//                         diesel_async::RunQueryDsl::execute(
-//                             diesel::insert_into(cetus_custom_indexer::table)
-//                                 .values(&cetus_custom_events)
-//                                 .on_conflict(cetus_custom_indexer::pool_id)
-//                                 .do_update()
-//                                 .set((
-//                                     cetus_custom_indexer::total_volume_24h.eq(sql("excluded.total_volume_24h")),
-//                                 )),
-//                             conn
-//                         )
-//                         .await
-//                         .unwrap_or_else(|_| {
-//                             panic!("Failed to process swap events: {:?}", swap_events)
-//                         });
-//                     }
-
-//                     Ok(())
-//                 }
-//                 .scope_boxed()
-//             })
-//             .await
-//         }
- }
-
+}
 
 #[async_trait]
 impl Worker for CetusIndexerWorker {
@@ -100,28 +57,45 @@ impl Worker for CetusIndexerWorker {
         let mut indexer = self.indexer.lock().await;
         
         // Process the checkpoint - pass sqlx_pool as Option<&Pool<Postgres>>
-        let swap_events = indexer.process_checkpoint(checkpoint, self.sqlx_pool.as_ref()).await;
+        let (swap_events, liquidity_events) = indexer.process_checkpoint(checkpoint, self.sqlx_pool.as_ref()).await;
         
-        if !swap_events.is_empty() {
+        if !swap_events.is_empty() || !liquidity_events.is_empty() {
             info!("------------------------------------");
             info!("CHECKPOINT: {}", checkpoint.checkpoint_summary.sequence_number);
             info!("Timestamp: {}", checkpoint.checkpoint_summary.timestamp_ms);
-            info!("Found {} Cetus swap events", swap_events.len());
-            for (idx, event) in swap_events.iter().enumerate() {
-                info!("SWAP EVENT #{}", idx + 1);
-                info!("Transaction: {}", event.transaction_digest);
-                info!("Pool ID: {}", event.pool_id);
-                info!("Amount In: {}", event.amount_in);
-                info!("Amount Out: {}", event.amount_out);
-                info!("Direction: {}", if event.atob { "USDC -> SUI" } else { "SUI -> USDC" });
-                info!("SUI Amount: {}", if event.atob { event.amount_out } else { event.amount_in });
-                info!("------------------------------------");
+            
+            // Log swap events
+            if !swap_events.is_empty() {
+                info!("Found {} Cetus swap events", swap_events.len());
+                for (idx, event) in swap_events.iter().enumerate() {
+                    info!("SWAP EVENT #{}", idx + 1);
+                    info!("Transaction: {}", event.transaction_digest);
+                    info!("Pool ID: {}", event.pool_id);
+                    info!("Amount In: {}", event.amount_in);
+                    info!("Amount Out: {}", event.amount_out);
+                    info!("Direction: {}", if event.atob { "USDC -> SUI" } else { "SUI -> USDC" });
+                    info!("SUI Amount: {}", if event.atob { event.amount_out } else { event.amount_in });
+                }
             }
             
-            // Log current 24h volume
+            // Log liquidity events
+            if !liquidity_events.is_empty() {
+                info!("Found {} Cetus liquidity events", liquidity_events.len());
+                for (idx, event) in liquidity_events.iter().enumerate() {
+                    info!("LIQUIDITY EVENT #{}", idx + 1);
+                    info!("Transaction: {}", event.transaction_digest);
+                    info!("Pool ID: {}", event.pool_id);
+                    info!("USDC Amount: {}", event.amount_a);
+                    info!("SUI Amount: {}", event.amount_b);
+                }
+            }
+            
+            // Log current 24h metrics
             info!("💰 Current 24h Volume: ${:.2}", indexer.volume_24h.sui_usd_volume / 1_000_000.0);
+            info!("💎 Current 24h TVL: ${:.2}", indexer.tvl_24h.total_usd_tvl / 1_000_000.0);
+            info!("------------------------------------");
         }
-        // self.commit_to_db(&swap_events).await?;
+        
         Ok(())
     }
 }
@@ -151,7 +125,7 @@ async fn main() -> Result<()> {
         .parse::<bool>()
         .unwrap_or(false);
 
-    info!("🚀 Starting SUI-USDC Pool Volume Indexer"); 
+    info!("🚀 Starting SUI-USDC Pool Volume & TVL Indexer"); 
     info!("📁 Checkpoints dir: {}", checkpoints_dir);
     info!("💾 Database enabled: {}", use_database);
     info!("🎯 Target pool: 0xb8d7d9e66a60c239e7a60110efcf8de6c705580ed924d0dde141f4a0e2c90105");
@@ -179,7 +153,7 @@ async fn main() -> Result<()> {
             error!("❌ Failed to create volume_data table: {}", err);
         }
         
-        // Initialize volume from database if it exists
+        // Initialize data from database
         let mut indexer_locked = indexer.lock().await;
         match CetusIndexer::get_last_processed_checkpoint(&pool).await {
             Ok(checkpoint) => {
@@ -191,18 +165,16 @@ async fn main() -> Result<()> {
             }
         }
         
-        match CetusIndexer::get_volume_24h_from_database(&pool).await {
-            Ok(volume_data) => {
-                let sui_usd_volume = volume_data.sui_usd_volume;
-                indexer_locked.volume_24h = volume_data;
-                info!("✅ Loaded 24h volume from database: ${:.2}", sui_usd_volume / 1_000_000.0);
-            }
-            Err(err) => {
-                error!("❌ Failed to load 24h volume from database: {}", err);
-            }
+        // Load both volume and TVL data
+        if let Err(err) = indexer_locked.update_data_in_database(&pool).await {
+            error!("❌ Failed to load data from database: {}", err);
+        } else {
+            info!("✅ Loaded data from database:");
+            info!("   24h Volume: ${:.2}", indexer_locked.volume_24h.sui_usd_volume / 1_000_000.0);
+            info!("   24h TVL: ${:.2}", indexer_locked.tvl_24h.total_usd_tvl / 1_000_000.0);
         }
         
-        // Start background job to update volume every 10 minutes
+        // Start background job to update volume and TVL every 10 minutes
         let job_indexer = indexer.clone();
         let job_pool = pool.clone();
         tokio::spawn(async move {
@@ -217,7 +189,7 @@ async fn main() -> Result<()> {
     let worker_pool = WorkerPool::new(
         CetusIndexerWorker::new(indexer.clone(), diesel_pool, sqlx_pool),
         "cetus_indexing".to_string(),
-        25, // lower concurrency since we're just logging
+        25,
     );
     executor.register(worker_pool).await?;
 
