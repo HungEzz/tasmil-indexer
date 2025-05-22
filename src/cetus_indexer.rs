@@ -137,7 +137,7 @@ impl CetusIndexer {
         let checkpoint_timestamp = data.checkpoint_summary.timestamp();
 
         // Log basic checkpoint information
-        info!("aaaaProcessing checkpoint {} with {} transactions", 
+        info!("Processing checkpoint {} with {} transactions", 
              checkpoint_seq_number, data.transactions.len());
 
         for transaction in &data.transactions {
@@ -184,7 +184,6 @@ impl CetusIndexer {
         
         // Extract events from transaction
         if let Ok(events_json) = serde_json::to_value(&transaction.events) {
-            
             // Check if the structure is {data: [...]}
             if let Some(data) = events_json.get("data").and_then(|d| d.as_array()) {    
                 // Process each event
@@ -320,7 +319,7 @@ impl CetusIndexer {
         // Convert volume to string to avoid type mismatches with NUMERIC
         let sui_usd_volume_str = format!("{:.8}", self.volume_24h.sui_usd_volume);
         
-        // Build and execute query with string parameters
+        // Build and execute query with string parameters 
         let query = format!(
             "INSERT INTO volume_data (period, sui_usd_volume, last_update, last_processed_checkpoint) 
              VALUES ('24h', '{}', $1, {})
@@ -463,16 +462,13 @@ async fn get_sui_price_from_pyth() -> Result<f64, Error> {
     let response = client.get(&url).send().await?;
     let price_feed_data: serde_json::Value = response.json().await?;
     
-    debug!("Got price feed data from Pyth Network");
-    
     // Parse the price from the response
     if let Some(price_data) = price_feed_data.as_array().and_then(|arr| arr.first()) {
-        if let Some(price_obj) = price_data.get("price") {
+        if let Some(price_obj) = price_data.get("ema_price") {
             // Try to parse the price values
             let price = price_obj["price"].as_str()
                 .ok_or_else(|| anyhow::anyhow!("Price value not found or not a string"))?
                 .parse::<i64>()?;
-                
             let expo = price_obj["expo"].as_i64()
                 .ok_or_else(|| anyhow::anyhow!("Expo value not found"))?;
             
