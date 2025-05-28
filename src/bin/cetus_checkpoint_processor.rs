@@ -73,6 +73,7 @@ impl Worker for CetusIndexerWorker {
                     info!("Pool ID: {}", event.pool_id);
                     info!("Amount In: {}", event.amount_in);
                     info!("Amount Out: {}", event.amount_out);
+                    info!("Fee Amount: {}", event.fee_amount);
                     info!("Direction: {}", if event.atob { "USDC -> SUI" } else { "SUI -> USDC" });
                     info!("SUI Amount: {}", if event.atob { event.amount_out } else { event.amount_in });
                 }
@@ -93,6 +94,7 @@ impl Worker for CetusIndexerWorker {
             // Log current 24h metrics
             info!("💰 Current 24h Volume: ${:.2}", indexer.volume_24h.sui_usd_volume / 1_000_000.0);
             info!("💎 Current 24h TVL: ${:.2}", indexer.tvl_24h.total_usd_tvl / 1_000_000.0);
+            info!("💵 Current 24h Fees: ${:.2}", indexer.fee_24h.fees_24h / 1_000_000.0);
             info!("------------------------------------");
         }
         
@@ -165,13 +167,14 @@ async fn main() -> Result<()> {
             }
         }
         
-        // Load both volume and TVL data
+        // Load data from database
         if let Err(err) = indexer_locked.update_data_in_database(&pool).await {
             error!("❌ Failed to load data from database: {}", err);
         } else {
             info!("✅ Loaded data from database:");
             info!("   24h Volume: ${:.2}", indexer_locked.volume_24h.sui_usd_volume / 1_000_000.0);
             info!("   24h TVL: ${:.2}", indexer_locked.tvl_24h.total_usd_tvl / 1_000_000.0);
+            info!("   24h Fees: ${:.2}", indexer_locked.fee_24h.fees_24h / 1_000_000.0);
         }
         
         // Start background job to update volume and TVL every 10 minutes
@@ -205,4 +208,4 @@ async fn main() -> Result<()> {
         .await?;
     
     Ok(())
-} 
+}

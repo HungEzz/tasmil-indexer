@@ -17,8 +17,8 @@ use reqwest;
 const SUI_USDC_POOL_ID: &str = "0xb8d7d9e66a60c239e7a60110efcf8de6c705580ed924d0dde141f4a0e2c90105";
 /// Cetus pool contract address
 const CETUS_ADDRESS: &str = "1eabed72c53feb3805120a081dc15963c204dc8d091542592abaf7a35689b2fb";
-/// Returns a tuple containing (pool_id, amount_in, amount_out, atob) if successful
-fn decode_swap_event_contents(contents: &[serde_json::Value]) -> Option<(String, u64, u64, bool)> {
+/// Returns a tuple containing (pool_id, amount_in, amount_out, atob, fee_amount) if successful
+fn decode_swap_event_contents(contents: &[serde_json::Value]) -> Option<(String, u64, u64, bool, u64)> {
     if contents.len() < 146 {
         debug!("Contents array too short for fallback decoding, expected at least 146 elements");
     }
@@ -56,7 +56,13 @@ fn decode_swap_event_contents(contents: &[serde_json::Value]) -> Option<(String,
             amount_out |= (val as u64) << (i * 8);
         }
     }
-    
+       // amount_out is at position 73-80 (8 bytes, little-endian)
+       let mut fee_amount: u64 = 0;
+       for i in 0..8 {
+           if let Some(val) = contents.get(i + 89).and_then(|v| v.as_u64()) {
+               fee_amount |= (val as u64) << (i * 8);
+           }
+       }
     // CRITICAL FIX: Based on the first byte, set atob correctly
     // First transaction (first_byte=0) should have atob=true
     // Second transaction (first_byte=1) should have atob=false
@@ -73,10 +79,10 @@ fn decode_swap_event_contents(contents: &[serde_json::Value]) -> Option<(String,
             .unwrap_or(0) == 1
     };
     
-    debug!("Decoded swap: pool={}, amount_in={}, amount_out={}, direction={}", 
-          pool_id, amount_in, amount_out, if atob { "USDC→SUI" } else { "SUI→USDC" });
+    debug!("Decoded swap: pool={}, amount_in={}, amount_out={}, direction={}, fee_amount={}", 
+          pool_id, amount_in, amount_out, if atob { "USDC→SUI" } else { "SUI→USDC" }, fee_amount);
     
-    Some((pool_id, amount_in, amount_out, atob))
+    Some((pool_id, amount_in, amount_out, atob, fee_amount))
 }
 
 /// Represents a single swap event in the Cetus AMM
@@ -89,6 +95,7 @@ pub struct SwapEvent {
     /// true = USDC→SUI (user sells USDC to get SUI)
     /// false = SUI→USDC (user sells SUI to get USDC)
     pub atob: bool,
+    pub fee_amount: u64,
     pub timestamp: SystemTime,
     pub transaction_digest: String,
 }
@@ -112,8 +119,6 @@ async fn get_usdc_price_from_pyth() -> Result<f64, Error> {
     let url = format!("https://hermes.pyth.network/api/latest_price_feeds?ids[]={}", price_id);
     let response = client.get(&url).send().await?;
     let price_feed_data: serde_json::Value = response.json().await?;
-    info!("USDC Price feed data: {:?}", price_feed_data);
-    debug!("Got USDC price feed data from Pyth Network");
     
     // Parse the price from the response
     if let Some(price_data) = price_feed_data.as_array().and_then(|arr| arr.first()) {
@@ -198,6 +203,22 @@ pub struct TvlData {
     pub last_update: SystemTime,
 }
 
+/// Fee data for 24-hour fees
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeeData {
+    pub fees_24h: f64,
+    pub last_update: SystemTime,
+}
+
+impl Default for FeeData {
+    fn default() -> Self {
+        Self {
+            fees_24h: 0.0,
+            last_update: SystemTime::now(),
+        }
+    }
+}
+
 /// Main indexer that tracks Cetus AMM events and calculates volumes/TVL
 #[derive(Clone)]
 pub struct CetusIndexer {
@@ -209,6 +230,8 @@ pub struct CetusIndexer {
     pub volume_24h: VolumeData,
     /// Current 24-hour TVL data
     pub tvl_24h: TvlData,
+    /// Current 24-hour fee data
+    pub fee_24h: FeeData,
     /// Last checkpoint that was processed
     pub last_processed_checkpoint: u64,
 }
@@ -227,6 +250,7 @@ impl CetusIndexer {
                 total_usd_tvl: 0.0,
                 last_update: SystemTime::now(),
             },
+            fee_24h: FeeData::default(),
             last_processed_checkpoint: 0,
         }
     }
@@ -277,10 +301,18 @@ impl CetusIndexer {
             // Calculate TVL
             let tvl = self.calculate_tvl_24h().await;
             let tvl_in_dollars = tvl / 1_000_000.0;
+
+            // Calculate 24h fees
+            let fees = self.calculate_fees_24h().await;
+            let fees_in_dollars = fees / 1_000_000.0;
             
-            info!("📊 Checkpoint {}: Found {} swap events, {} liquidity events | 24h Volume: ${:.2} | TVL: ${:.2}", 
+            info!("📊 Checkpoint {}: Found {} swap events, {} liquidity events | 24h Volume: ${:.2} | TVL: ${:.2} | Fees: ${:.2}", 
                  checkpoint_seq_number, new_swap_events.len(), new_liquidity_events.len(), 
-                 volume_in_dollars, tvl_in_dollars);
+                 volume_in_dollars, tvl_in_dollars, fees_in_dollars);
+
+            // Update fee data with new fees
+            self.fee_24h.fees_24h = fees;
+            self.fee_24h.last_update = SystemTime::now();
         }
 
         // Update checkpoint tracking
@@ -328,7 +360,7 @@ impl CetusIndexer {
                     if is_cetus_swap {
                         // Extract and decode contents
                         if let Some(contents) = event.get("contents").and_then(|c| c.as_array()) {
-                            if let Some((decoded_pool_id, amount_in, amount_out, atob)) = decode_swap_event_contents(contents) {
+                            if let Some((decoded_pool_id, amount_in, amount_out, atob, fee_amount)) = decode_swap_event_contents(contents) {
                                 // Skip events with zero amounts
                                 if amount_in == 0 || amount_out == 0 {
                                     continue;
@@ -342,6 +374,7 @@ impl CetusIndexer {
                                         amount_in,
                                         amount_out,
                                         atob,
+                                        fee_amount,
                                         timestamp,
                                         transaction_digest: tx_digest.clone(),
                                     });
@@ -650,6 +683,54 @@ impl CetusIndexer {
         total_usd_tvl
     }
     
+    /// Calculate 24-hour fees in USD from stored swap events
+    pub async fn calculate_fees_24h(&mut self) -> f64 {
+        let now = SystemTime::now();
+        let twenty_four_hours_ago = now.checked_sub(Duration::from_secs(24 * 60 * 60))
+            .unwrap_or(UNIX_EPOCH);
+        
+        // Filter events from the last 24 hours
+        let recent_events: Vec<&SwapEvent> = self.swap_events.iter()
+            .filter(|event| event.timestamp >= twenty_four_hours_ago)
+            .collect();
+        
+        // Get current prices
+        let sui_price_usd = match get_sui_price_from_pyth().await {
+            Ok(price) => price,
+            Err(e) => {
+                error!("Failed to get SUI price: {}", e);
+                return 0.0;
+            }
+        };
+
+        let usdc_price_usd = match get_usdc_price_from_pyth().await {
+            Ok(price) => price,
+            Err(e) => {
+                error!("Failed to get USDC price: {}", e);
+                return 0.0;
+            }
+        };
+
+        // Calculate total fees
+        let mut total_fees = 0.0;
+        
+        for event in recent_events.iter() {
+            let fee_in_usd = if event.atob {
+                // If atob is true, amount_in is USDC
+                (event.fee_amount as f64 / 1_000_000.0) * usdc_price_usd // USDC has 6 decimals
+            } else {
+                // If atob is false, amount_in is SUI
+                (event.fee_amount as f64 / 1_000_000_000.0) * sui_price_usd // SUI has 9 decimals
+            };
+            
+            total_fees += fee_in_usd * 1_000_000.0; // Convert to microdollars
+        }
+
+        info!("24h Fees calculation: ${:.2}", total_fees / 1_000_000.0);
+        
+        total_fees
+    }
+    
     /// Update both volume and TVL data in the database
     pub async fn update_data_in_database(&self, pool: &PgPool) -> Result<(), Error> {
         let now = SystemTime::now();
@@ -658,20 +739,54 @@ impl CetusIndexer {
         // Convert values to strings to avoid type mismatches with NUMERIC
         let sui_usd_volume_str = format!("{:.8}", self.volume_24h.sui_usd_volume);
         let total_usd_tvl_str = format!("{:.8}", self.tvl_24h.total_usd_tvl);
+        let fees_24h_str = format!("{:.8}", self.fee_24h.fees_24h);
         
-        // Build and execute query with string parameters 
-        let query = format!(
-            "INSERT INTO volume_data (period, sui_usd_volume, total_usd_tvl, last_update, last_processed_checkpoint) 
-             VALUES ('24h', '{}', '{}', $1, {})
-             ON CONFLICT (period) 
-             DO UPDATE SET sui_usd_volume = '{}', total_usd_tvl = '{}', last_update = $1, last_processed_checkpoint = {}",
-            sui_usd_volume_str,
-            total_usd_tvl_str,
-            self.last_processed_checkpoint,
-            sui_usd_volume_str,
-            total_usd_tvl_str,
-            self.last_processed_checkpoint
-        );
+        // Check if fees_24h column exists
+        let check_column = sqlx::query(
+            "SELECT column_name FROM information_schema.columns 
+             WHERE table_name = 'volume_data' AND column_name = 'fees_24h'"
+        )
+        .fetch_optional(pool)
+        .await?;
+        
+        // Check if fee_amount column exists in swap_events table
+        let check_fee_column = sqlx::query(
+            "SELECT column_name FROM information_schema.columns 
+             WHERE table_name = 'swap_events' AND column_name = 'fee_amount'"
+        )
+        .fetch_optional(pool)
+        .await?;
+        
+        // Build query based on whether fees_24h column exists
+        let query = if check_column.is_some() {
+            format!(
+                "INSERT INTO volume_data (period, sui_usd_volume, total_usd_tvl, fees_24h, last_update, last_processed_checkpoint) 
+                 VALUES ('24h', '{}', '{}', '{}', $1, {})
+                 ON CONFLICT (period) 
+                 DO UPDATE SET sui_usd_volume = '{}', total_usd_tvl = '{}', fees_24h = '{}', last_update = $1, last_processed_checkpoint = {}",
+                sui_usd_volume_str,
+                total_usd_tvl_str,
+                fees_24h_str,
+                self.last_processed_checkpoint,
+                sui_usd_volume_str,
+                total_usd_tvl_str,
+                fees_24h_str,
+                self.last_processed_checkpoint
+            )
+        } else {
+            format!(
+                "INSERT INTO volume_data (period, sui_usd_volume, total_usd_tvl, last_update, last_processed_checkpoint) 
+                 VALUES ('24h', '{}', '{}', $1, {})
+                 ON CONFLICT (period) 
+                 DO UPDATE SET sui_usd_volume = '{}', total_usd_tvl = '{}', last_update = $1, last_processed_checkpoint = {}",
+                sui_usd_volume_str,
+                total_usd_tvl_str,
+                self.last_processed_checkpoint,
+                sui_usd_volume_str,
+                total_usd_tvl_str,
+                self.last_processed_checkpoint
+            )
+        };
         
         sqlx::query(&query)
             .bind(now_sql)
@@ -682,28 +797,57 @@ impl CetusIndexer {
         // First, store swap events
         for event in &self.swap_events {
             let event_timestamp = chrono::DateTime::<chrono::Utc>::from(event.timestamp).naive_utc();
-            let query = format!(
-                "INSERT INTO swap_events (
-                    pool_id, 
-                    amount_in, 
-                    amount_out, 
-                    atob, 
-                    timestamp, 
-                    transaction_digest
-                ) VALUES (
-                    '{}', 
-                    '{}', 
-                    '{}', 
-                    {}, 
-                    $1, 
-                    '{}'
-                ) ON CONFLICT (transaction_digest) DO NOTHING",
-                event.pool_id,
-                event.amount_in,
-                event.amount_out,
-                event.atob,
-                event.transaction_digest
-            );
+            
+            let query = if check_fee_column.is_some() {
+                format!(
+                    "INSERT INTO swap_events (
+                        pool_id, 
+                        amount_in, 
+                        amount_out, 
+                        atob, 
+                        fee_amount,
+                        timestamp, 
+                        transaction_digest
+                    ) VALUES (
+                        '{}', 
+                        '{}', 
+                        '{}', 
+                        {}, 
+                        {}, 
+                        $1, 
+                        '{}'
+                    ) ON CONFLICT (transaction_digest) DO NOTHING",
+                    event.pool_id,
+                    event.amount_in,
+                    event.amount_out,
+                    event.atob,
+                    event.fee_amount,
+                    event.transaction_digest
+                )
+            } else {
+                format!(
+                    "INSERT INTO swap_events (
+                        pool_id, 
+                        amount_in, 
+                        amount_out, 
+                        atob, 
+                        timestamp, 
+                        transaction_digest
+                    ) VALUES (
+                        '{}', 
+                        '{}', 
+                        '{}', 
+                        {}, 
+                        $1, 
+                        '{}'
+                    ) ON CONFLICT (transaction_digest) DO NOTHING",
+                    event.pool_id,
+                    event.amount_in,
+                    event.amount_out,
+                    event.atob,
+                    event.transaction_digest
+                )
+            };
             
             sqlx::query(&query)
                 .bind(event_timestamp)
@@ -745,6 +889,37 @@ impl CetusIndexer {
         
         Ok(())
     }
+
+    /// Get data from database
+    pub async fn get_data_from_database(&mut self, pool: &PgPool) -> Result<(), Error> {
+        let row = sqlx::query(
+            "SELECT sui_usd_volume, total_usd_tvl, fees_24h, last_update FROM volume_data WHERE period = '24h'"
+        )
+        .fetch_optional(pool)
+        .await?;
+
+        if let Some(row) = row {
+            let sui_usd_volume: f64 = row.get("sui_usd_volume");
+            let total_usd_tvl: f64 = row.get("total_usd_tvl");
+            let fees_24h: f64 = row.get("fees_24h");
+            let last_update: chrono::NaiveDateTime = row.get("last_update");
+            let last_update = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                last_update,
+                chrono::Utc,
+            ).into();
+
+            self.volume_24h.sui_usd_volume = sui_usd_volume;
+            self.volume_24h.last_update = last_update;
+            
+            self.tvl_24h.total_usd_tvl = total_usd_tvl;
+            self.tvl_24h.last_update = last_update;
+
+            self.fee_24h.fees_24h = fees_24h;
+            self.fee_24h.last_update = last_update;
+        }
+
+        Ok(())
+    }
 }
 
 /// Background job to periodically update volume data
@@ -778,12 +953,30 @@ pub async fn create_volume_data_table(pool: &PgPool) -> Result<(), Error> {
             period VARCHAR(50) NOT NULL UNIQUE,
             sui_usd_volume NUMERIC(30, 8) NOT NULL DEFAULT 0,
             total_usd_tvl NUMERIC(30, 8) NOT NULL DEFAULT 0,
+            fees_24h NUMERIC(30, 8) NOT NULL DEFAULT 0,
             last_update TIMESTAMP NOT NULL,
             last_processed_checkpoint BIGINT NOT NULL DEFAULT 0
         )"
     )
     .execute(pool)
     .await?;
+    
+    // Check if fees_24h column exists, add it if it doesn't
+    let check_column = sqlx::query(
+        "SELECT column_name FROM information_schema.columns 
+         WHERE table_name = 'volume_data' AND column_name = 'fees_24h'"
+    )
+    .fetch_optional(pool)
+    .await?;
+    
+    if check_column.is_none() {
+        info!("Adding missing fees_24h column to volume_data table");
+        sqlx::query!(
+            "ALTER TABLE volume_data ADD COLUMN IF NOT EXISTS fees_24h NUMERIC(30, 8) NOT NULL DEFAULT 0"
+        )
+        .execute(pool)
+        .await?;
+    }
     
     // Create swap_events table
     sqlx::query!(
@@ -793,12 +986,30 @@ pub async fn create_volume_data_table(pool: &PgPool) -> Result<(), Error> {
             amount_in NUMERIC(30, 0) NOT NULL,
             amount_out NUMERIC(30, 0) NOT NULL,
             atob BOOLEAN NOT NULL,
+            fee_amount NUMERIC(30, 0) NOT NULL,
             timestamp TIMESTAMP NOT NULL,
             transaction_digest VARCHAR(255) NOT NULL UNIQUE
         )"
     )
     .execute(pool)
     .await?;
+    
+    // Check if fee_amount column exists in swap_events table, add it if it doesn't
+    let check_fee_column = sqlx::query(
+        "SELECT column_name FROM information_schema.columns 
+         WHERE table_name = 'swap_events' AND column_name = 'fee_amount'"
+    )
+    .fetch_optional(pool)
+    .await?;
+    
+    if check_fee_column.is_none() {
+        info!("Adding missing fee_amount column to swap_events table");
+        sqlx::query!(
+            "ALTER TABLE swap_events ADD COLUMN IF NOT EXISTS fee_amount NUMERIC(30, 0) NOT NULL DEFAULT 0"
+        )
+        .execute(pool)
+        .await?;
+    }
     
     // Create liquidity_events table
     sqlx::query!(
