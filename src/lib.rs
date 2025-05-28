@@ -1,9 +1,33 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+//! SuiNS Indexer - A high-performance indexer for Sui blockchain data
+//! 
+//! This crate provides indexing capabilities for Sui blockchain events,
+//! specifically focusing on Cetus AMM protocol data.
+
+// Core modules
 pub mod cetus_indexer;
+pub mod config;
+pub mod database;
 pub mod models;
 pub mod schema;
+
+// Re-exports for convenience
+pub use cetus_indexer::{CetusIndexer, SwapEvent, AddLiquidityEvent};
+pub use config::{Config, init_config, get_config};
+pub use database::DatabaseManager;
+pub use models::*;
+
+// Type aliases for better ergonomics
+pub type PgConnectionPool = diesel_async::pooled_connection::bb8::Pool<diesel_async::AsyncPgConnection>;
+pub type PgPoolConnection<'a> = diesel_async::pooled_connection::bb8::PooledConnection<'a, diesel_async::AsyncPgConnection>;
+
+// Re-export commonly used types from dependencies
+pub use sui_types::full_checkpoint_content::{CheckpointData, CheckpointTransaction};
+pub use sui_types::effects::{TransactionEffects as CheckpointTransactionEffect};
+pub use sui_types::transaction::TransactionDataAPI;
+pub use sui_types::event::Event as CheckpointTransactionEffectEvent;
 
 use dotenvy::dotenv;
 use std::env;
@@ -16,11 +40,6 @@ use diesel_async::AsyncPgConnection;
 use futures_util::future::BoxFuture;
 use futures_util::FutureExt;
 use std::time::Duration;
-
-pub type PgConnectionPool =
-    diesel_async::pooled_connection::bb8::Pool<diesel_async::AsyncPgConnection>;
-pub type PgPoolConnection<'a> =
-    diesel_async::pooled_connection::bb8::PooledConnection<'a, AsyncPgConnection>;
 
 // Extension trait to add new() method to PgConnectionPool
 pub trait PgConnectionPoolExt {
@@ -40,12 +59,14 @@ impl PgConnectionPoolExt for PgConnectionPool {
             config,
         );
 
-        futures::executor::block_on(async {
-            Pool::builder()
-                .connection_timeout(Duration::from_secs(30))
-                .build(manager)
-                .await
-                .expect("Could not build Postgres DB connection pool")
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                Pool::builder()
+                    .connection_timeout(Duration::from_secs(30))
+                    .build(manager)
+                    .await
+                    .expect("Could not build Postgres DB connection pool")
+            })
         })
     }
 }

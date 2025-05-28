@@ -1,1 +1,0 @@
-ALTER TABLE volume_data DROP COLUMN fees_24h; 
